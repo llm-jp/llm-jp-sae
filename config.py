@@ -45,6 +45,7 @@ class TrainConfig:
     num_workers: int = 12
     buffer_size: int = 500_000
     tokens: int = 100_000_000
+    tokens_eval: int = 10_000_000
 
 
 @dataclass
@@ -59,5 +60,5 @@ def return_save_dir(args):
     elif args.hf_model:
         model = f"{args.hf_model.replace('/', '_')}_{args.hf_revision}"
 
-    save_dir = f"{args.save_dir}/{model}/layer{args.layer}/n{args.num_latents}_k{args.k}"
+    save_dir = f"{args.save_dir}/{model}/layer{args.layer}/n{args.num_latents}_k{args.k}/lr{args.lr}"
     return save_dir

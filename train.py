@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from contextlib import nullcontext
 
@@ -75,15 +76,52 @@ def train(sae, activation_buffer, train_cfg):
     return sae
 
 
+def evaluate(sae, activation_buffer, train_cfg):
+    autocast_context = (
+        nullcontext() if device.type == "cpu" else torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    )
+    total_tokens = train_cfg.tokens_eval
+    n_token = 0
+    loss_accum = 0.0
+
+    sae.eval()
+    pbar = tqdm(total=total_tokens)
+
+    with torch.no_grad():
+        for step, x in enumerate(activation_buffer):
+            x = x / x.norm(dim=-1, keepdim=True)
+
+            with autocast_context:
+                x_hat = sae(x)
+                e = x - x_hat
+                loss = e.pow(2).sum(dim=-1).mean()
+                loss.backward()
+                loss_accum += loss.item()
+
+            n_token += x.shape[0]
+            pbar.update(x.shape[0])
+
+            if n_token >= total_tokens:
+                break
+
+    results = {"eval_loss": loss_accum / (step + 1)}
+
+    return results
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_dir", type=str, default="./output")
+
     parser.add_argument("--local_model", type=str)
     parser.add_argument("--hf_model", type=str)
     parser.add_argument("--hf_revision", type=str, default="main")
     parser.add_argument("--layer", type=int, default=12, help="Layer (>= 1) to analyze.")
+
     parser.add_argument("--local_data", type=str, help="Path to the directory containing train_data.pt and val_data.pt")
     parser.add_argument("--hf_data", type=str, help="HuggingFace dataset repository")
+    parser.add_argument("--hf_name", type=str)
+
     parser.add_argument("--num_latents", type=int, default=32768, help="Dimensionality of SAE's hidden layer")
     parser.add_argument("--k", type=int, default=32, help="K parameter for SAE (sparsity)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
@@ -115,6 +153,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.hf_model, revision=args.hf_revision)
     else:
         raise ValueError("Specify either --local_model or --hf_model")
+    model.eval()
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -128,9 +167,10 @@ def main():
     ### Load Data
     train_cfg = TrainConfig(lr=args.lr)
     if args.hf_data:
-        dataset = load_dataset(args.hf_data, name="CC-MAIN-2024-10", split="train", streaming=True)
+        dataset = load_dataset(args.hf_data, name=args.hf_name, split="train", streaming=True)
         dataset = dataset.map(
-            lambda x: tokenizer(x["text"], truncation=True, padding=True, max_length=train_cfg.ctx_len), batched=True
+            lambda x: tokenizer(x["text"], truncation=True, padding=True, max_length=train_cfg.ctx_len),
+            batched=True,
         )
 
     ### Prepare Activation Buffer
@@ -157,6 +197,11 @@ def main():
 
     ### Save SAE
     sae.save_pretrained(save_dir)
+
+    ### Evaluate SAE
+    results = evaluate(sae=sae, activation_buffer=activation_buffer, train_cfg=train_cfg)
+    with open(f"{save_dir}/results.json", "w") as f:
+        json.dump(results, f, indent=4)
 
 
 if __name__ == "__main__":
