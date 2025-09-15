@@ -2,31 +2,7 @@ from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
-from transformers import PreTrainedModel
-from config import SaeConfig
-
-
-def normalize_activation(activation: Tensor, nl: str) -> Tensor:
-    if nl == "Standardization":
-        mean = activation.mean(dim=-1, keepdim=True)
-        std = activation.std(dim=-1, keepdim=True) + 1e-6
-        return (activation - mean) / std
-    elif nl == "Scalar":
-        return activation / activation.norm(dim=-1, keepdim=True)
-    elif nl == "None":
-        return activation
-    else:
-        raise ValueError(f"Normalization layer {nl} not supported.")
-
-
-class SimpleHook:
-    def __init__(self, module):
-        self.hook = module.register_forward_hook(self.hook_fn, with_kwargs=True)
-
-    def hook_fn(self, module, args, kwargs, output):
-        self.args = args
-        self.kwargs = kwargs
-        self.output = output
+from transformers import PretrainedConfig, PreTrainedModel
 
 
 class EncoderOutput(NamedTuple):
@@ -41,55 +17,81 @@ class ForwardOutput(NamedTuple):
     loss: Tensor
 
 
-class SparseAutoEncoder(PreTrainedModel):
-    config_class = SaeConfig
-    def __init__(self, cfg):
-        super().__init__(cfg)
-        self.cfg = cfg
-        self.d_in = cfg.d_in
-        self.num_latents = self.d_in * cfg.expansion_factor
-        self.torch_dtype = cfg.torch_dtype
+class TopKSAEConfig(PretrainedConfig):
+    model_type = "topk_sae"
+    def __init__(
+        self,
+        d_in: int = 2048,
+        num_latents: int = 32768,
+        k: int = 32,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.d_in = d_in
+        self.num_latents = num_latents
+        self.k = k
 
-        self.encoder = nn.Linear(self.d_in, self.num_latents, dtype=self.torch_dtype)
+
+class TopKSAE(PreTrainedModel):
+    config_class = TopKSAEConfig
+
+    def __init__(self, cfg: TopKSAEConfig):
+        super().__init__(cfg)
+        self.d_in = cfg.d_in
+        self.num_latents = cfg.num_latents
+        self.k = cfg.k
+
+        self.decoder = nn.Linear(self.num_latents, self.d_in, bias=False)
+        self.set_decoder_norm_to_unit_norm()
+
+        self.encoder = nn.Linear(self.d_in, self.num_latents)
+        self.encoder.weight.data = self.decoder.weight.T.clone()
         self.encoder.bias.data.zero_()
 
-        self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
+        self.b_dec = nn.Parameter(torch.zeros(self.d_in))
 
-        self.set_decoder_norm_to_unit_norm()
-        self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.torch_dtype))
+    def encode(self, x: torch.Tensor, return_topk: bool = False):
+        post_relu_feat_acts_BF = nn.functional.relu(self.encoder(x - self.b_dec))
+        post_topk = post_relu_feat_acts_BF.topk(self.k, sorted=False, dim=-1)
 
-    def select_topk(self, latents: Tensor) -> EncoderOutput:
-        """Select the top-k latents."""
-        return EncoderOutput(*latents.topk(self.cfg.k, sorted=False))
+        topk_acts_BK = post_topk.values
+        topk_indices_BK = post_topk.indices
 
-    def forward(self, x: Tensor) -> ForwardOutput:
-        sae_in = x.to(self.torch_dtype) - self.b_dec
+        buffer_BF = torch.zeros_like(post_relu_feat_acts_BF)
+        encoded_acts_BF = buffer_BF.scatter_(dim=-1, index=topk_indices_BK, src=topk_acts_BK)
 
-        latents = self.encoder(sae_in)
-        latents = nn.functional.relu(latents)
-        top_acts, top_indices = self.select_topk(latents)
-        buf = top_acts.new_zeros(top_acts.shape[:-1] + (self.W_dec.shape[-2],))
-        acts = buf.scatter_(dim=-1, index=top_indices, src=top_acts)
+        if return_topk:
+            return (
+                encoded_acts_BF,
+                topk_acts_BK,
+                topk_indices_BK,
+            )
+        else:
+            return encoded_acts_BF
 
-        sae_out = acts @ self.W_dec + self.b_dec
+    def decode(self, x: torch.Tensor):
+        return self.decoder(x) + self.b_dec
 
-        # compute loss
-        e = sae_out - x
-        l2_loss = e.pow(2).sum()
-        total_variance = (x - x.mean(0)).pow(2).sum()
-        loss = l2_loss / total_variance
+    def forward(self, x: torch.Tensor, output_features: bool = False):
+        encoded_output = self.encode(x, return_topk=output_features)
+        if output_features:
+            encoded_acts_BF, topk_acts_BK, topk_indices_BK = encoded_output
+        else:
+            encoded_acts_BF = encoded_output
 
-        return ForwardOutput(
-            sae_out,
-            top_acts,
-            top_indices,
-            loss,
-        )
+        x_hat_BD = self.decode(encoded_acts_BF)
+
+        if output_features:
+            return (
+                x_hat_BD,
+                topk_acts_BK,
+                topk_indices_BK,
+            )
+        else:
+            return x_hat_BD
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-
-        eps = torch.finfo(self.W_dec.dtype).eps
-        norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
-        self.W_dec.data /= norm + eps
+        eps = torch.finfo(self.decoder.weight.dtype).eps
+        norm = torch.norm(self.decoder.weight.data, dim=0, keepdim=True)
+        self.decoder.weight.data /= norm + eps

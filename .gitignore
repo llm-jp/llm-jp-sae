@@ -174,3 +174,8 @@ cython_debug/
 .pypirc
 
 .DS_Store
+
+hf_share/
+output/
+upload_hf.py
+load_hf.py

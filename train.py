@@ -1,30 +1,20 @@
 import argparse
 import os
+from contextlib import nullcontext
 
 import torch
-from torch import Tensor
-from torch.utils.data import DataLoader
+from activation_buffer import ActivationBuffer
+from config import TrainConfig, return_save_dir
+from datasets import load_dataset
+from model import TopKSAE, TopKSAEConfig
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, get_constant_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_constant_schedule_with_warmup
 
-from config import SaeConfig, TrainConfig, UsrConfig, return_save_dir
-from dataset import CustomWikiDataset
-from model import SimpleHook, SparseAutoEncoder, normalize_activation
-
-if torch.cuda.is_available():
-    if torch.cuda.device_count() > 1:
-        MODEL_DEVICE = torch.device("cuda:0")
-        SAE_DEVICE = torch.device("cuda:1")
-    else:
-        MODEL_DEVICE = torch.device("cuda")
-        SAE_DEVICE = torch.device("cuda")
-else:
-    MODEL_DEVICE = torch.device("cpu")
-    SAE_DEVICE = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @torch.no_grad()
-def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> Tensor:
+def geometric_median(points: torch.Tensor, max_iter: int = 100, tol: float = 1e-5) -> torch.Tensor:
     """Compute the geometric median `points`. Used for initializing decoder bias."""
     # Initialize our guess as the mean of the points
     guess = points.mean(dim=0)
@@ -40,157 +30,133 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> 
     return guess
 
 
-def train(
-    dl_train, dl_val, train_cfg, model_dir, layer, n_d, k, nl, ckpt, lr, save_dir
-):
-    # load the language model to extract activations
-    model = AutoModelForCausalLM.from_pretrained(
-        os.path.join(model_dir, f"iter_{str(ckpt).zfill(7)}"),
-        torch_dtype=torch.bfloat16,
-    ).to(MODEL_DEVICE)
-    model.eval()
-
-    # initialize the sparse autoencoder
-    sae_config = SaeConfig(n_d=n_d, k=k)
-    sae = SparseAutoEncoder(sae_config).to(SAE_DEVICE)
-    optimizer = torch.optim.Adam(sae.parameters(), lr=lr, eps=6.25e-10)
-    lr_scheduler = get_constant_schedule_with_warmup(
-        optimizer, num_warmup_steps=train_cfg.lr_warmup_steps
+def train(sae, activation_buffer, train_cfg):
+    optimizer = torch.optim.Adam(sae.parameters(), lr=train_cfg.lr, eps=6.25e-10)
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=train_cfg.num_warmup_steps)
+    autocast_context = (
+        nullcontext() if device.type == "cpu" else torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     )
+    total_tokens = train_cfg.tokens
+    logging_step = train_cfg.logging_step
+    n_token = 0
+    loss_accum = 0.0
 
-    # setup hook
-    hook_layer = (
-        model.model.embed_tokens if layer == 0 else model.model.layers[layer - 1]
-    )
-    hook = SimpleHook(hook_layer)
+    sae.train()
+    pbar = tqdm(total=total_tokens)
 
-    global_step = 0
-    loss_sum = 0.0
+    for step, x in enumerate(activation_buffer):
+        x = x / x.norm(dim=-1, keepdim=True)
+        if step == 0:
+            median = geometric_median(x)
+            sae.b_dec.data = median.to(sae.dtype)
 
-    for batch in tqdm(dl_train, desc="Training"):
-        with torch.inference_mode():
-            _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
-            # remove sos token
-            activation = activation[:, 1:, :]
-            # (batch_size, seq_len, hidden_size) -> (batch_size * seq_len, hidden_size)
-            activation = activation.flatten(0, 1)
-            # normalize activations
-            activation = normalize_activation(activation, nl)
-
-        # split the activations into chunks
-        for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
-            # Initialize decoder bias with the geometric median of the chunk
-            if global_step == 0:
-                median = geometric_median(chunk.to(SAE_DEVICE))
-                sae.b_dec.data = median.to(sae.dtype)
-            # make sure the decoder weights are unit norm
-            sae.set_decoder_norm_to_unit_norm()
-            optimizer.zero_grad()
-            out = sae(chunk.to(SAE_DEVICE))
-            loss = out.loss
+        with autocast_context:
+            x_hat = sae(x)
+            e = x - x_hat
+            loss = e.pow(2).sum(dim=-1).mean()
             loss.backward()
-            loss_sum += loss.item()
+            loss_accum += loss.item()
+
             optimizer.step()
-            lr_scheduler.step()
+            optimizer.zero_grad()
+            scheduler.step()
 
-            if global_step % train_cfg.logging_step == 0 and global_step > 0:
-                print(f"Step: {global_step}, Loss: {loss_sum / train_cfg.logging_step}")
-                loss_sum = 0.0
-            global_step += 1
+            sae.set_decoder_norm_to_unit_norm()
 
-    # save the trained SAE
-    torch.save(sae.state_dict(), os.path.join(save_dir, "sae.pth"))
+        n_token += x.shape[0]
+        pbar.update(x.shape[0])
+        if (step + 1) % logging_step == 0:
+            pbar.set_postfix({"loss": loss_accum / logging_step, "step": step + 1})
+            loss_accum = 0.0
 
-    # evaluation
-    del dl_train, optimizer, lr_scheduler
-    sae.eval()
-    loss_eval = 0
+        if n_token >= total_tokens:
+            break
 
-    with torch.no_grad():
-        for batch in tqdm(dl_val):
-            _ = model(batch.to(MODEL_DEVICE), use_cache=False)
-            activation = hook.output if layer == 0 else hook.output[0]
-            activation = activation[:, 1:, :]
-            activation = activation.flatten(0, 1)
-            activation = normalize_activation(activation, nl)
-            for chunk in torch.chunk(activation, train_cfg.inf_bs_expansion, dim=0):
-                out = sae(chunk.to(SAE_DEVICE))
-                loss_eval += out.loss.item()
-        print(f"Validation Loss: {loss_eval / len(dl_val)}")
+    return sae
 
-    print("Training finished.")
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save_dir", type=str, default="./output")
+    parser.add_argument("--local_model", type=str)
+    parser.add_argument("--hf_model", type=str)
+    parser.add_argument("--hf_revision", type=str, default="main")
+    parser.add_argument("--layer", type=int, default=12, help="Layer (>= 1) to analyze.")
+    parser.add_argument("--local_data", type=str, help="Path to the directory containing train_data.pt and val_data.pt")
+    parser.add_argument("--hf_data", type=str, help="HuggingFace dataset repository")
+    parser.add_argument("--num_latents", type=int, default=32768, help="Dimensionality of SAE's hidden layer")
+    parser.add_argument("--k", type=int, default=32, help="K parameter for SAE (sparsity)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=int, default=988240, help="Checkpoint")
-    parser.add_argument(
-        "--layer", type=int, default=12, help="Layer index to extract activations"
-    )
-    parser.add_argument("--n_d", type=int, default=16, help="Expansion ratio (n/d)")
-    parser.add_argument(
-        "--k", type=int, default=32, help="K parameter for SAE (sparsity)"
-    )
-    parser.add_argument(
-        "--nl",
-        type=str,
-        default="Scalar",
-        help="normalization method: Standardization, Scalar, None",
-    )
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    args = parser.parse_args()
+    args = parse_args()
 
-    usr_cfg = UsrConfig()
-    train_cfg = TrainConfig()
-
-    train_data_pth = os.path.join(usr_cfg.tokenized_data_dir, "train_data.pt")
-    val_data_pth = os.path.join(usr_cfg.tokenized_data_dir, "val_data.pt")
-
-    dataset_train = CustomWikiDataset(train_data_pth)
-    dataset_val = CustomWikiDataset(val_data_pth)
-    dl_train = DataLoader(
-        dataset_train,
-        batch_size=train_cfg.batch_size * train_cfg.inf_bs_expansion,
-        shuffle=True,
-    )
-    dl_val = DataLoader(
-        dataset_val,
-        batch_size=train_cfg.batch_size * train_cfg.inf_bs_expansion,
-        shuffle=False,
-    )
-
-    print(
-        f"Layer: {args.layer}, n/d: {args.n_d}, k: {args.k}, nl: {args.nl}, ckpt: {args.ckpt}, lr: {args.lr}"
-    )
-    save_dir = return_save_dir(
-        usr_cfg.sae_save_dir,
-        args.layer,
-        args.n_d,
-        args.k,
-        args.nl,
-        args.ckpt,
-        args.lr,
-    )
-    if os.path.exists(os.path.join(save_dir, "sae.pth")):
-        print(f"Already exists at: {save_dir}")
-        if input("Overwrite? (y/n): ").lower() != "y":
-            exit()
+    ### save dir for this experiment
+    save_dir = return_save_dir(args)
     os.makedirs(save_dir, exist_ok=True)
 
-    train(
-        dl_train,
-        dl_val,
-        train_cfg,
-        usr_cfg.llmjp_model_dir,
-        args.layer,
-        args.n_d,
-        args.k,
-        args.nl,
-        args.ckpt,
-        args.lr,
-        save_dir,
+    ### Load Language Model
+    print("Loading language model...")
+    if args.local_model:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.local_model,
+            torch_dtype="bfloat16",
+        ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(args.local_model)
+    elif args.hf_model:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model,
+            revision=args.hf_revision,
+            trust_remote_code=True,
+            torch_dtype="bfloat16",
+        ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(args.hf_model, revision=args.hf_revision)
+    else:
+        raise ValueError("Specify either --local_model or --hf_model")
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ### Get submodule
+    if 0 <= args.layer < len(model.model.layers):
+        submodule = f"model.layers.{args.layer}"
+    else:
+        raise ValueError(f"Layer {args.layer} is out of range.")
+
+    ### Load Data
+    train_cfg = TrainConfig(lr=args.lr)
+    if args.hf_data:
+        dataset = load_dataset(args.hf_data, name="CC-MAIN-2024-10", split="train", streaming=True)
+        dataset = dataset.map(
+            lambda x: tokenizer(x["text"], truncation=True, padding=True, max_length=train_cfg.ctx_len), batched=True
+        )
+
+    ### Prepare Activation Buffer
+    activation_buffer = ActivationBuffer(
+        model=model,
+        submodule=submodule,
+        dataset=dataset,
+        buffer_size=train_cfg.buffer_size,
+        refresh_batch_size=train_cfg.bs_lm,
+        batch_size=train_cfg.bs_sae,
+        device=device,
     )
+
+    ### Initialize SAE
+    sae_cfg = TopKSAEConfig(num_latents=args.num_latents, k=args.k)
+    sae = TopKSAE(sae_cfg).to(device)
+
+    ### Train SAE
+    sae = train(
+        sae=sae,
+        activation_buffer=activation_buffer,
+        train_cfg=train_cfg,
+    )
+
+    ### Save SAE
+    sae.save_pretrained(save_dir)
 
 
 if __name__ == "__main__":

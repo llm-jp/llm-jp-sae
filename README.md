@@ -13,6 +13,13 @@ We trained SAEs separately on six different checkpoints of [LLM-jp-3-1.8B](https
 ### Environment
 Python 3.10.12
 
+```
+uv init
+uv sync
+```
+
+
+
 ```bash
 python -m venv venv
 source venv/bin/activate
