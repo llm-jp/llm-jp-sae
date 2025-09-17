@@ -50,7 +50,6 @@ class ActivationBuffer:
 
     def tokenized_batch(self):
         batch = next(self._iterator)
-        # return {k: torch.tensor(v).to(self.device) for k, v in batch.items() if k in ["input_ids", "attention_mask"]}
         return torch.tensor(batch["input_ids"]).to(self.device), torch.tensor(batch["attention_mask"]).to(self.device)
 
     def refresh(self):
@@ -69,23 +68,23 @@ class ActivationBuffer:
         new_activations[: len(self.activations)] = self.activations
         self.activations = new_activations
 
-        while current_idx < self.buffer_size:
-            with torch.no_grad():
+        with torch.no_grad():
+            while current_idx < self.buffer_size:
                 input_ids, attention_mask = self.tokenized_batch()
-                with Trace(self.model, self.submodule) as trace:
+                with Trace(self.model, self.submodule, stop=True) as trace:
                     _ = self.model(input_ids)
-                    hidden_states = trace.output[0]  # B x T x D
+                hidden_states = trace.output[0]  # B x T x D
 
-            if self.remove_bos:
-                ### for left padding
-                left_most_indices = (attention_mask == 1).float().cumsum(dim=-1)
-                attention_mask[left_most_indices == 1] = 0
-            hidden_states = hidden_states[attention_mask != 0]
+                if self.remove_bos:
+                    ### for left padding
+                    left_most_indices = (attention_mask == 1).float().cumsum(dim=-1)
+                    attention_mask[left_most_indices == 1] = 0
+                hidden_states = hidden_states[attention_mask != 0]
 
-            remaining_space = self.buffer_size - current_idx
-            hidden_states = hidden_states[:remaining_space]
+                remaining_space = self.buffer_size - current_idx
+                hidden_states = hidden_states[:remaining_space]
 
-            self.activations[current_idx : current_idx + len(hidden_states)] = hidden_states
-            current_idx += len(hidden_states)
+                self.activations[current_idx : current_idx + len(hidden_states)] = hidden_states
+                current_idx += len(hidden_states)
 
         self.read = torch.zeros(len(self.activations), dtype=torch.bool, device=self.device)

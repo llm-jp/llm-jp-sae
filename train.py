@@ -4,12 +4,12 @@ import os
 from contextlib import nullcontext
 
 import torch
-from activation_buffer import ActivationBuffer
 from config import TrainConfig, return_save_dir
 from datasets import load_dataset
 from model import TopKSAE, TopKSAEConfig
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_constant_schedule_with_warmup
+from utils.activation_buffer import ActivationBuffer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,6 +40,7 @@ def train(sae, activation_buffer, train_cfg):
     total_tokens = train_cfg.tokens
     logging_step = train_cfg.logging_step
     n_token = 0
+    train_loss = []
     loss_accum = 0.0
 
     sae.train()
@@ -67,13 +68,13 @@ def train(sae, activation_buffer, train_cfg):
         n_token += x.shape[0]
         pbar.update(x.shape[0])
         if (step + 1) % logging_step == 0:
-            pbar.set_postfix({"loss": loss_accum / logging_step, "step": step + 1})
+            train_loss.append(loss_accum / logging_step)
             loss_accum = 0.0
 
         if n_token >= total_tokens:
             break
 
-    return sae
+    return sae, train_loss
 
 
 def evaluate(sae, activation_buffer, train_cfg):
@@ -83,6 +84,7 @@ def evaluate(sae, activation_buffer, train_cfg):
     total_tokens = train_cfg.tokens_eval
     n_token = 0
     loss_accum = 0.0
+    cos_sim = 0.0
 
     sae.eval()
     pbar = tqdm(total=total_tokens)
@@ -95,8 +97,9 @@ def evaluate(sae, activation_buffer, train_cfg):
                 x_hat = sae(x)
                 e = x - x_hat
                 loss = e.pow(2).sum(dim=-1).mean()
-                loss.backward()
                 loss_accum += loss.item()
+
+                cos_sim += torch.nn.functional.cosine_similarity(x, x_hat, dim=-1).mean().item()
 
             n_token += x.shape[0]
             pbar.update(x.shape[0])
@@ -104,9 +107,7 @@ def evaluate(sae, activation_buffer, train_cfg):
             if n_token >= total_tokens:
                 break
 
-    results = {"eval_loss": loss_accum / (step + 1)}
-
-    return results
+    return loss_accum / (step + 1), cos_sim / (step + 1)
 
 
 def parse_args():
@@ -159,8 +160,8 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     ### Get submodule
-    if 0 <= args.layer < len(model.model.layers):
-        submodule = f"model.layers.{args.layer}"
+    if 1 <= args.layer <= len(model.model.layers):
+        submodule = f"model.layers.{args.layer - 1}"
     else:
         raise ValueError(f"Layer {args.layer} is out of range.")
 
@@ -189,7 +190,7 @@ def main():
     sae = TopKSAE(sae_cfg).to(device)
 
     ### Train SAE
-    sae = train(
+    sae, train_loss = train(
         sae=sae,
         activation_buffer=activation_buffer,
         train_cfg=train_cfg,
@@ -199,9 +200,12 @@ def main():
     sae.save_pretrained(save_dir)
 
     ### Evaluate SAE
-    results = evaluate(sae=sae, activation_buffer=activation_buffer, train_cfg=train_cfg)
+    eval_loss, cos_sim = evaluate(sae=sae, activation_buffer=activation_buffer, train_cfg=train_cfg)
+
+    print(f"Eval loss: {eval_loss}")
+    print(f"Cosine similarity: {cos_sim}")
     with open(f"{save_dir}/results.json", "w") as f:
-        json.dump(results, f, indent=4)
+        json.dump({"eval_loss": eval_loss, "cosine_similarity": cos_sim, "train_loss": train_loss}, f, indent=4)
 
 
 if __name__ == "__main__":

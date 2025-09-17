@@ -179,3 +179,4 @@ hf_share/
 output/
 upload_hf.py
 load_hf.py
+run.sh
